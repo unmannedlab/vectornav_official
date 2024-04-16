@@ -25,6 +25,8 @@
 
 #include <cmath>
 #include <iostream>
+#include <signal.h>
+
 
 // No need to define PI twice if we already have it included...
 //#define M_PI 3.14159265358979323846  /* M_PI */
@@ -91,6 +93,14 @@ struct UserData
   // strides
   unsigned int imu_stride;
   unsigned int output_stride;
+
+  //Synchronization controls
+  int sync_out_skip_count;
+
+  //Antenna Offsets
+  vec3f antenna_A_offset;
+  vec3f antenna_B_offset;
+  vec3f antenna_B_offset_uncert;
 };
 
 // Basic loop so we can initilize our covariance parameters above
@@ -117,6 +127,9 @@ bool resetOdom(
   user_data->initial_position_set = false;
   return true;
 }
+
+
+
 
 // Assure that the serial port is set to async low latency in order to reduce delays and package pilup.
 // These changes will stay effective until the device is unplugged
@@ -147,6 +160,23 @@ bool optimize_serial_communication(std::string portName)
 bool optimize_serial_communication(str::string portName) { return true; }
 #endif
 
+// Create a VnSensor object and connect to sensor
+VnSensor vs;
+
+// Disconnect the device when the node is killed
+void mySigintHandler(int sig)
+{
+  vs.unregisterAsyncPacketReceivedHandler();
+  ros::Duration(0.5).sleep();
+  ROS_INFO("Unregisted the Packet Received Handler");
+  vs.disconnect();
+  ros::Duration(0.5).sleep();
+  string mn = vs.readModelNumber();
+  ROS_INFO("%s is disconnected successfully", mn.c_str());
+  ROS_INFO("Shutting down node");
+  ros::shutdown();
+}
+
 int main(int argc, char * argv[])
 {
   // keeping all information passed to callback
@@ -170,12 +200,14 @@ int main(int argc, char * argv[])
 
   // Serial Port Settings
   string SensorPort;
-  int SensorBaudrate;
-  int async_output_rate;
-  int imu_output_rate;
-
   // Sensor IMURATE (800Hz by default, used to configure device)
   int SensorImuRate;
+  
+  //sensor baud rate  
+  int SensorBaudrate;
+
+  int async_output_rate;
+  int imu_output_rate;
 
   // Load all params
   pn.param<std::string>("map_frame_id", user_data.map_frame_id, "map");
@@ -188,6 +220,16 @@ int main(int argc, char * argv[])
   pn.param<std::string>("serial_port", SensorPort, "/dev/ttyUSB0");
   pn.param<int>("serial_baud", SensorBaudrate, 115200);
   pn.param<int>("fixed_imu_rate", SensorImuRate, 800);
+  pn.param<int>("sync_out_skip_count", user_data.sync_out_skip_count, 0);
+  pn.param<float>("antenna_a_offset_x", user_data.antenna_A_offset[0], 0);
+  pn.param<float>("antenna_a_offset_y", user_data.antenna_A_offset[1], 0);
+  pn.param<float>("antenna_a_offset_z", user_data.antenna_A_offset[2], 0);
+  pn.param<float>("antenna_ab_offset_x", user_data.antenna_B_offset[0], 0);
+  pn.param<float>("antenna_ab_offset_y", user_data.antenna_B_offset[1], 0);
+  pn.param<float>("antenna_ab_offset_z", user_data.antenna_B_offset[2], 0);
+  pn.param<float>("antenna_ab_uncert_x", user_data.antenna_B_offset_uncert[0], 0);
+  pn.param<float>("antenna_ab_uncert_y", user_data.antenna_B_offset_uncert[1], 0);
+  pn.param<float>("antenna_ab_uncert_z", user_data.antenna_B_offset_uncert[2], 0);
 
   //Call to set covariances
   if (pn.getParam("linear_accel_covariance", rpc_temp)) {
@@ -205,8 +247,7 @@ int main(int argc, char * argv[])
   // try to optimize the serial port
   optimize_serial_communication(SensorPort);
 
-  // Create a VnSensor object and connect to sensor
-  VnSensor vs;
+
 
   // Default baudrate variable
   int defaultBaudrate;
@@ -277,7 +318,7 @@ int main(int argc, char * argv[])
   // calculate the least common multiple of the two rate and assure it is a
   // valid package rate, also calculate the imu and output strides
   int package_rate = 0;
-  for (int allowed_rate : {1, 2, 4, 5, 10, 20, 25, 40, 50, 100, 200, 0}) {
+  for (int allowed_rate : {1, 2, 4, 5, 10, 20, 25, 40, 50, 100, 200, 400, 800, 0}) {
     package_rate = allowed_rate;
     if ((package_rate % async_output_rate) == 0 && (package_rate % imu_output_rate) == 0) break;
   }
@@ -297,6 +338,19 @@ int main(int argc, char * argv[])
 
   // Make sure no generic async output is registered
   vs.writeAsyncDataOutputType(VNOFF);
+
+  SynchronizationControlRegister syncer;
+  syncer.syncOutMode = SYNCOUTMODE_IMUREADY;
+  syncer.syncOutPolarity = SYNCOUTPOLARITY_NEGATIVE;
+  syncer.syncOutPulseWidth = 2000000;
+  syncer.syncOutSkipFactor = user_data.sync_out_skip_count;
+
+  vs.writeSynchronizationControl(syncer, true);
+
+  vs.writeGpsCompassBaseline(user_data.antenna_B_offset, user_data.antenna_B_offset_uncert, true);
+
+  vs.writeGpsAntennaOffset(user_data.antenna_A_offset, true);
+  
 
   // Configure binary output message
   BinaryOutputRegister bor(
@@ -327,17 +381,19 @@ int main(int argc, char * argv[])
   // You spin me right round, baby
   // Right round like a record, baby
   // Right round round round
-  while (ros::ok()) {
-    ros::spin();  // Need to make sure we disconnect properly. Check if all ok.
-  }
+  // while (ros::ok()) {
+  //   ros::spin();  // Need to make sure we disconnect properly. Check if all ok.
+  // }
 
-  // Node has been terminated
-  vs.unregisterAsyncPacketReceivedHandler();
-  ros::Duration(0.5).sleep();
-  ROS_INFO("Unregisted the Packet Received Handler");
-  vs.disconnect();
-  ros::Duration(0.5).sleep();
-  ROS_INFO("%s is disconnected successfully", mn.c_str());
+  // // Node has been terminated
+  // vs.unregisterAsyncPacketReceivedHandler();
+  // ros::Duration(0.5).sleep();
+  // ROS_INFO("Unregisted the Packet Received Handler");
+  // vs.disconnect();
+  // ros::Duration(0.5).sleep();
+  // ROS_INFO("%s is disconnected successfully", mn.c_str());
+  signal(SIGINT, mySigintHandler);
+  ros::spin();
   return 0;
 }
 
